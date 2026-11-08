@@ -1,3 +1,4 @@
 node_modules/
-linklocator.sqlite
+.env
 *.sqlite
+.tmp/

@@ -1,191 +1,32 @@
 const express = require("express");
 const { nanoid } = require("nanoid");
-const fs = require("fs");
-const path = require("path");
+const { createClient } = require("@supabase/supabase-js");
 
-// ─── Database Abstraction ──────────────────────────────────────
-// Supports Postgres (DATABASE_URL) or SQLite (sql.js) as fallback
+// ─── Supabase Client ───────────────────────────────────────────
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_ANON_KEY;
 
-function createSqliteDb() {
-  const initSqlJs = require("sql.js");
-  const DB_PATH = path.join(process.env.DATA_DIR || __dirname, "linklocator.sqlite");
-
-  return initSqlJs().then(SQL => {
-    let db;
-    if (fs.existsSync(DB_PATH)) {
-      db = new SQL.Database(fs.readFileSync(DB_PATH));
-    } else {
-      db = new SQL.Database();
-    }
-
-    let saveTimer = null;
-    function save() {
-      // Debounced: batch writes instead of fs.writeFileSync on every insert
-    // Note: SIGKILL/OOM kills process before timer fires — up to 500ms of data loss
-    // This is acceptable for analytics; SIGTERM/SIGINT trigger saveNow() for clean shutdown
-      if (saveTimer) return;
-      saveTimer = setTimeout(() => {
-        try { fs.writeFileSync(DB_PATH, Buffer.from(db.export())); } catch (e) { console.error("sqlite save error:", e.message); }
-        saveTimer = null;
-      }, 500);
-    }
-    // Immediate save for schema init and explicit shutdown
-    function saveNow() {
-      if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; }
-      try { fs.writeFileSync(DB_PATH, Buffer.from(db.export())); } catch (e) { console.error("sqlite save error:", e.message); }
-    }
-
-    db.run(`CREATE TABLE IF NOT EXISTS links (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      slug TEXT UNIQUE NOT NULL,
-      destination TEXT NOT NULL,
-      label TEXT,
-      tracking_mode TEXT DEFAULT 'redirect',
-      gps_interval INTEGER DEFAULT 30,
-      max_pings INTEGER DEFAULT 100,
-      created_at TEXT DEFAULT (datetime('now')),
-      active INTEGER DEFAULT 1
-    )`);
-    db.run(`CREATE TABLE IF NOT EXISTS clicks (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      link_id INTEGER NOT NULL,
-      ip TEXT,
-      referrer TEXT,
-      user_agent TEXT,
-      country TEXT,
-      region TEXT,
-      city TEXT,
-      lat REAL,
-      lon REAL,
-      isp TEXT,
-      gps_accuracy REAL,
-      clicked_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (link_id) REFERENCES links(id) ON DELETE CASCADE
-    )`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_clicks_link ON clicks(link_id)`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_clicks_at ON clicks(clicked_at)`);
-    db.run(`CREATE TABLE IF NOT EXISTS location_pings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      click_id INTEGER NOT NULL,
-      lat REAL,
-      lon REAL,
-      accuracy REAL,
-      pinged_at TEXT DEFAULT (datetime('now')),
-      FOREIGN KEY (click_id) REFERENCES clicks(id) ON DELETE CASCADE
-    )`);
-    db.run(`CREATE INDEX IF NOT EXISTS idx_pings_click ON location_pings(click_id)`);
-    saveNow();
-
-    // SQLite WAL mode for better read concurrency
-    try { db.run("PRAGMA journal_mode=WAL"); } catch (e) { console.error("WAL set failed:", e.message); }
-    // Enforce foreign keys (off by default in SQLite)
-    try { db.run("PRAGMA foreign_keys=ON"); } catch (e) { console.error("FK pragma failed:", e.message); }
-
-    process.on("SIGINT", () => { saveNow(); process.exit(0); });
-    process.on("SIGTERM", () => { saveNow(); process.exit(0); });
-
-    return {
-      type: "sqlite",
-      all(stmt, params = []) {
-        const s = db.prepare(stmt); s.bind(params);
-        const rows = []; try { while (s.step()) rows.push(s.getAsObject()); } finally { s.free(); }
-        return rows;
-      },
-      get(stmt, params = []) {
-        return this.all(stmt, params)[0] || null;
-      },
-      async run(stmt, params = []) {
-        db.run(stmt, params); save();
-      },
-    };
-  });
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error("❌ SUPABASE_URL and SUPABASE_SERVICE_KEY are required.");
+  console.error("   Get them from: https://app.supabase.com → Project Settings → API");
+  process.exit(1);
 }
 
-function createPostgresDb() {
-  const { Pool } = require("pg");
-  const poolOpts = { connectionString: process.env.DATABASE_URL };
-  if (!process.env.DATABASE_URL.includes("sslmode=")) poolOpts.ssl = { rejectUnauthorized: false };
-  const pool = new Pool(poolOpts);
-  pool.on("error", (err) => console.error("Postgres pool error:", err.message));
-
-  return pool.query(`
-    CREATE TABLE IF NOT EXISTS links (
-      id SERIAL PRIMARY KEY,
-      slug TEXT UNIQUE NOT NULL,
-      destination TEXT NOT NULL,
-      label TEXT,
-      tracking_mode TEXT DEFAULT 'redirect',
-      gps_interval INTEGER DEFAULT 30,
-      max_pings INTEGER DEFAULT 100,
-      created_at TIMESTAMPTZ DEFAULT NOW(),
-      active BOOLEAN DEFAULT TRUE
-    );
-    CREATE TABLE IF NOT EXISTS clicks (
-      id SERIAL PRIMARY KEY,
-      link_id INTEGER NOT NULL REFERENCES links(id) ON DELETE CASCADE,
-      ip TEXT,
-      referrer TEXT,
-      user_agent TEXT,
-      country TEXT,
-      region TEXT,
-      city TEXT,
-      lat DOUBLE PRECISION,
-      lon DOUBLE PRECISION,
-      isp TEXT,
-      gps_accuracy DOUBLE PRECISION,
-      clicked_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_clicks_link ON clicks(link_id);
-    CREATE INDEX IF NOT EXISTS idx_clicks_at ON clicks(clicked_at);
-    CREATE TABLE IF NOT EXISTS location_pings (
-      id SERIAL PRIMARY KEY,
-      click_id INTEGER NOT NULL REFERENCES clicks(id) ON DELETE CASCADE,
-      lat DOUBLE PRECISION,
-      lon DOUBLE PRECISION,
-      accuracy DOUBLE PRECISION,
-      pinged_at TIMESTAMPTZ DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_pings_click ON location_pings(click_id);
-  `).then(() => ({
-    type: "postgres",
-    async all(text, params = []) {
-      const { rows } = await pool.query(text, params);
-      return rows;
-    },
-    async get(text, params = []) {
-      const { rows } = await pool.query(text, params);
-      return rows[0] || null;
-    },
-    async run(text, params = []) {
-      await pool.query(text, params);
-    },
-  })).then(db => {
-    process.on("SIGINT", () => { pool.end().then(() => process.exit(0)); });
-    process.on("SIGTERM", () => { pool.end().then(() => process.exit(0)); });
-    return db;
-  });
-}
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { autoRefreshToken: false, persistSession: false }
+});
 
 // ─── Main ──────────────────────────────────────────────────────
 
 async function main() {
-  const db = process.env.DATABASE_URL
-    ? await createPostgresDb()
-    : await createSqliteDb();
-
-  console.log(`📦 Database: ${db.type}`);
-
   const app = express();
-  app.set("trust proxy", 1); // Trust first proxy (Railway / nginx)
-  app.use(express.json({ limit: "1mb", strict: true })); // strict: reject non-objects at top level
+  app.set("trust proxy", 1);
+  app.use(express.json({ limit: "1mb", strict: true }));
 
-  // Wrap async route handlers so Express 4 catches rejected promises
   function asyncHandler(fn) {
     return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
   }
 
-  // Handle JSON parse errors with 400 instead of default 500
-  // (defined early so it catches errors from express.json() before routes)
   app.use((err, req, res, next) => {
     if (err.type === "entity.parse.failed") return res.status(400).json({ error: "invalid JSON body" });
     next(err);
@@ -197,17 +38,14 @@ async function main() {
     res.setHeader("X-Frame-Options", "SAMEORIGIN");
     res.setHeader("Referrer-Policy", "strict-origin-when-cross-origin");
     res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()");
-    // CSP: restrict script/frame/img/connect sources; inline scripts/styles needed for interstitial + dashboard
     res.setHeader("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; frame-src https://www.google.com; connect-src 'self'; font-src 'self'");
     if (req.secure || req.headers["x-forwarded-proto"] === "https") res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
     res.removeHeader("X-Powered-By");
     next();
   });
 
-  // Health check (for Railway / monitoring)
-  app.get("/api/health", (req, res) => res.json({ status: "ok", db: db.type, uptime: process.uptime() }));
+  app.get("/api/health", (req, res) => res.json({ status: "ok", db: "supabase", uptime: process.uptime() }));
 
-  // Skip common static paths that aren't short links
   const STATIC_PATHS = ["/favicon.ico", "/robots.txt", "/sitemap.xml", "/.well-known"];
   app.use((req, res, next) => {
     if (STATIC_PATHS.some(p => req.path.startsWith(p))) return res.status(204).end();
@@ -217,7 +55,7 @@ async function main() {
   const BASE_URL = process.env.BASE_URL || "";
 
   // ─── Geo IP lookup ─────────────────────────────────────────────
-  const GEO_API_KEY = process.env.GEO_API_KEY; // ipgeolocation.io key
+  const GEO_API_KEY = process.env.GEO_API_KEY;
   const geoCache = new Map();
   const GEO_CACHE_TTL = 3600000;
   const GEO_CACHE_MAX = 5000;
@@ -229,25 +67,20 @@ async function main() {
       if (now - v.ts > GEO_CACHE_TTL) geoCache.delete(k);
       if (geoCache.size <= GEO_CACHE_MAX) return;
     }
-    // Still too big? Evict oldest
     const entries = [...geoCache.entries()].sort((a, b) => a[1].ts - b[1].ts);
     for (let i = 0; i < entries.length - GEO_CACHE_MAX / 2; i++) geoCache.delete(entries[i][0]);
   }
 
   async function lookupGeo(ip) {
-    // Skip local/private IPs (172.16.0.0–172.31.255.255 is the actual private range)
-    // Also skip IPv6 private: fc00::/7 (unique local), fe80::/10 (link-local)
     if (!ip || ip === "unknown" || ip === "::1" || ip.startsWith("::ffff:127") || ip.startsWith("192.168.") || ip.startsWith("10.")) {
       return { country: "Local", region: "Local", city: "Local", lat: null, lon: null, isp: null };
     }
-    // Check IPv4 loopback (127.0.0.0/8) and 172.16.0.0/12 private ranges
     const ipParts = ip.replace(/^::ffff:/, "").split(".");
     if (ipParts.length === 4) {
       const a = parseInt(ipParts[0], 10), b = parseInt(ipParts[1], 10);
       if (a === 127) return { country: "Local", region: "Local", city: "Local", lat: null, lon: null, isp: null };
       if (a === 172 && b >= 16 && b <= 31) return { country: "Local", region: "Local", city: "Local", lat: null, lon: null, isp: null };
     }
-    // IPv6 private ranges
     if (/^f[cd][0-9a-f]{2}:/i.test(ip) || /^fe[89ab][0-9a-f]:/i.test(ip)) {
       return { country: "Local", region: "Local", city: "Local", lat: null, lon: null, isp: null };
     }
@@ -258,10 +91,9 @@ async function main() {
       const controller = new AbortController();
       fetchTimeout = setTimeout(() => controller.abort(), 5000);
       if (!GEO_API_KEY) {
-        // Fallback: ip-api.com (free, no key, 45 req/min) — free tier only supports HTTP
-        const res = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,lat,lon,isp`, { signal: controller.signal });
+        const r = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,regionName,city,lat,lon,isp`, { signal: controller.signal });
         clearTimeout(fetchTimeout);
-        const data = await res.json();
+        const data = await r.json();
         if (data.status === "success") {
           const geo = { country: data.country || null, region: data.regionName || null, city: data.city || null, lat: data.lat || null, lon: data.lon || null, isp: data.isp || null };
           geoCache.set(ip, { data: geo, ts: Date.now() }); pruneGeoCache();
@@ -269,24 +101,21 @@ async function main() {
         }
         return { country: null, region: null, city: null, lat: null, lon: null, isp: null };
       }
-      // ipgeolocation.io (30k req/mo free, paid for more)
-      const res = await fetch(`https://api.ipgeolocation.io/ipgeo?apiKey=${GEO_API_KEY}&ip=${ip}&fields=country_name,state_prov,city,latitude,longitude,isp`, { signal: controller.signal });
+      const r = await fetch(`https://api.ipgeolocation.io/ipgeo?apiKey=${GEO_API_KEY}&ip=${ip}&fields=country_name,state_prov,city,latitude,longitude,isp`, { signal: controller.signal });
       clearTimeout(fetchTimeout);
-      const data = await res.json();
+      const data = await r.json();
       if (data.country_name) {
         const geo = { country: data.country_name || null, region: data.state_prov || null, city: data.city || null, lat: data.latitude ? parseFloat(data.latitude) : null, lon: data.longitude ? parseFloat(data.longitude) : null, isp: data.isp || null };
         geoCache.set(ip, { data: geo, ts: Date.now() }); pruneGeoCache();
         return geo;
       }
     } catch (e) { console.error("geo lookup error:", e.message); }
-    // Ensure timeout always cleaned up on any exit path
     if (fetchTimeout) clearTimeout(fetchTimeout);
     return { country: null, region: null, city: null, lat: null, lon: null, isp: null };
   }
 
   function baseUrl(req) {
     if (BASE_URL) return BASE_URL;
-    // Auto-detect from request
     const proto = req.headers["x-forwarded-proto"] || (req.secure ? "https" : "http");
     const host = req.headers["host"] || "localhost";
     return `${proto}://${host}`;
@@ -298,31 +127,28 @@ async function main() {
     const { destination, label, slug: customSlug, tracking_mode, gps_interval, max_pings } = req.body;
     if (!destination) return res.status(400).json({ error: "destination is required" });
     try { const u = new URL(destination); if (!["http:","https:"].includes(u.protocol)) return res.status(400).json({ error: "only http/https destinations allowed" }); if (u.href.startsWith("//")) return res.status(400).json({ error: "protocol-relative URLs not allowed" }); } catch { return res.status(400).json({ error: "invalid destination URL" }); }
-    // Prevent self-referential links (infinite redirect loop)
     try { const dest = new URL(destination); const self = new URL(baseUrl(req)); if (dest.origin === self.origin) return res.status(400).json({ error: "destination cannot point to this app" }); } catch {}
     if (destination.length > 2048) return res.status(400).json({ error: "destination URL too long (max 2048)" });
     if (label && label.length > 200) return res.status(400).json({ error: "label too long (max 200)" });
-    // Limit total links
-    const count = await db.get("SELECT COUNT(*) as cnt FROM links");
-    if (Number(count?.cnt || 0) >= 1000) return res.status(429).json({ error: "link limit reached (1000). Delete some to create more." });
+
+    const { count, error: countErr } = await supabase.from("links").select("*", { count: "exact", head: true });
+    if (countErr) throw countErr;
+    if (Number(count || 0) >= 1000) return res.status(429).json({ error: "link limit reached (1000). Delete some to create more." });
 
     const slug = customSlug || nanoid(8);
-    // Validate slug: URL-safe, 1-64 chars, no path traversal
     if (!/^[a-zA-Z0-9_-]+$/.test(slug)) return res.status(400).json({ error: "slug must be alphanumeric, hyphens, or underscores only" });
     if (slug.length > 64) return res.status(400).json({ error: "slug too long (max 64)" });
     if (slug.length < 1) return res.status(400).json({ error: "slug too short" });
-    // Reserved slugs that would shadow API routes
     const RESERVED = ["api", "health", "links", "sms", "whoami", "click", "favicon", "robots"];
     if (RESERVED.includes(slug.toLowerCase())) return res.status(400).json({ error: `slug '${slug}' is reserved` });
-    const existing = await db.get("SELECT id FROM links WHERE slug = $1", [slug]);
+
+    const { data: existing } = await supabase.from("links").select("id").eq("slug", slug).maybeSingle();
     if (existing) return res.status(409).json({ error: "slug already in use" });
 
-    // Validate tracking options
     const validMode = (tracking_mode === "embed") ? "embed" : "redirect";
     const interval = (typeof gps_interval === "number" && gps_interval >= 5 && gps_interval <= 3600) ? Math.round(gps_interval) : 30;
     const maxPings = (typeof max_pings === "number" && max_pings >= 0 && max_pings <= 10000) ? Math.round(max_pings) : 100;
 
-    // If embed mode, check that the destination allows iframing
     let iframeWarning = null;
     if (validMode === "embed") {
       try {
@@ -338,71 +164,71 @@ async function main() {
           iframeWarning = "Destination CSP blocks framing (frame-ancestors 'none') — iframe will be blocked";
         }
       } catch (e) {
-        // Can't reach destination to check — allow but warn
         iframeWarning = "Could not verify destination allows iframing (request failed)";
       }
     }
 
-    await db.run("INSERT INTO links (slug, destination, label, tracking_mode, gps_interval, max_pings) VALUES ($1, $2, $3, $4, $5, $6)", [slug, destination, label || null, validMode, interval, maxPings]);
-    const link = await db.get("SELECT * FROM links WHERE slug = $1", [slug]);
+    const { data: link, error: insertErr } = await supabase.from("links").insert({
+      slug, destination, label: label || null, tracking_mode: validMode,
+      gps_interval: interval, max_pings: maxPings
+    }).select().single();
+    if (insertErr) throw insertErr;
+
     res.status(201).json({ ...link, active: !!link.active, short_url: `${baseUrl(req)}/${slug}`, iframe_warning: iframeWarning });
   }));
 
   // ─── API: List Links ───────────────────────────────────────────
   app.get("/api/links", asyncHandler(async (req, res) => {
-    const links = await db.all(`
-      SELECT l.*, (SELECT COUNT(*) FROM clicks c WHERE c.link_id = l.id) as click_count
-      FROM links l ORDER BY l.created_at DESC
-    `);
+    const { data: links, error } = await supabase.from("links_with_counts").select("*").order("created_at", { ascending: false });
+    if (error) throw error;
     res.json(links.map(l => ({ ...l, active: !!l.active, click_count: Number(l.click_count) })));
   }));
 
   // ─── API: Get Link Detail ──────────────────────────────────────
   app.get("/api/links/:slug", asyncHandler(async (req, res) => {
-    const link = await db.get("SELECT * FROM links WHERE slug = $1", [req.params.slug]);
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
+    if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: "link not found" });
 
-    const [clicks, stats, byDay, byCountry, byCity, pings] = await Promise.all([
-      db.all("SELECT * FROM clicks WHERE link_id = $1 ORDER BY clicked_at DESC LIMIT 200", [link.id]),
-      db.get(`SELECT COUNT(*) as total, COUNT(DISTINCT ip) as unique_ips,
-              MIN(clicked_at) as first_click, MAX(clicked_at) as last_click
-              FROM clicks WHERE link_id = $1`, [link.id]),
-      db.all(`SELECT DATE(clicked_at) as day, COUNT(*) as count
-              FROM clicks WHERE link_id = $1 GROUP BY day ORDER BY day DESC LIMIT 30`, [link.id]),
-      db.all(`SELECT country, COUNT(*) as count
-              FROM clicks WHERE link_id = $1 AND country IS NOT NULL
-              GROUP BY country ORDER BY count DESC LIMIT 15`, [link.id]),
-      db.all(`SELECT city, region, country, COUNT(*) as count
-              FROM clicks WHERE link_id = $1 AND city IS NOT NULL
-              GROUP BY city, region, country ORDER BY count DESC LIMIT 15`, [link.id]),
-      db.all("SELECT lp.* FROM location_pings lp JOIN clicks c ON lp.click_id = c.id WHERE c.link_id = $1 ORDER BY lp.pinged_at ASC", [link.id]),
+    const [clicksRes, statsRes, byDayRes, byCountryRes, byCityRes, pingsRes] = await Promise.all([
+      supabase.from("clicks").select("*").eq("link_id", link.id).order("clicked_at", { ascending: false }).limit(200),
+      supabase.rpc("link_stats", { p_link_id: link.id }),
+      supabase.rpc("clicks_by_day", { p_link_id: link.id }),
+      supabase.rpc("clicks_by_country", { p_link_id: link.id }),
+      supabase.rpc("clicks_by_city", { p_link_id: link.id }),
+      supabase.rpc("link_pings", { p_link_id: link.id }),
     ]);
 
+    const stats = statsRes.data || {};
     res.json({
       ...link, active: !!link.active,
       short_url: `${baseUrl(req)}/${link.slug}`,
-      stats: { total: Number(stats?.total || 0), unique_ips: Number(stats?.unique_ips || 0), first_click: stats?.first_click || null, last_click: stats?.last_click || null },
-      by_day: byDay, by_country: byCountry, by_city: byCity,
-      recent_clicks: clicks,
-      location_pings: pings,
+      stats: { total: Number(stats.total || 0), unique_ips: Number(stats.unique_ips || 0), first_click: stats.first_click || null, last_click: stats.last_click || null },
+      by_day: byDayRes.data || [],
+      by_country: byCountryRes.data || [],
+      by_city: byCityRes.data || [],
+      recent_clicks: clicksRes.data || [],
+      location_pings: pingsRes.data || [],
     });
   }));
 
   // ─── API: Toggle Active ────────────────────────────────────────
   app.patch("/api/links/:slug/toggle", asyncHandler(async (req, res) => {
-    const link = await db.get("SELECT * FROM links WHERE slug = $1", [req.params.slug]);
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
+    if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: "link not found" });
-    await db.run("UPDATE links SET active = $1 WHERE id = $2", [!link.active, link.id]);
-    const updated = await db.get("SELECT * FROM links WHERE id = $1", [link.id]);
+    const { data: updated, error: updErr } = await supabase.from("links").update({ active: !link.active }).eq("id", link.id).select().single();
+    if (updErr) throw updErr;
     res.json({ ...updated, active: !!updated.active });
   }));
 
   // ─── API: Delete Link ──────────────────────────────────────────
   app.delete("/api/links/:slug", asyncHandler(async (req, res) => {
-    const link = await db.get("SELECT * FROM links WHERE slug = $1", [req.params.slug]);
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
+    if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: "link not found" });
-    await db.run("DELETE FROM links WHERE id = $1", [link.id]);
-    // CASCADE auto-removes clicks (Postgres always, SQLite with PRAGMA foreign_keys=ON)
+    const { error: delErr } = await supabase.from("links").delete().eq("id", link.id);
+    if (delErr) throw delErr;
     res.json({ deleted: true });
   }));
 
@@ -418,17 +244,17 @@ async function main() {
     });
   }));
 
-  // ─── API: Record Click (called by interstitial JS) ───────────
+  // ─── API: Record Click ───────────────────────────────────────
   app.post("/api/click", asyncHandler(async (req, res) => {
     if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
     const { slug, gps_lat, gps_lon, gps_accuracy } = req.body;
     if (!slug) return res.status(400).json({ error: "slug required" });
-    // Validate GPS values are numeric
     const lat = typeof gps_lat === "number" ? gps_lat : undefined;
     const lon = typeof gps_lon === "number" ? gps_lon : undefined;
     const acc = typeof gps_accuracy === "number" ? gps_accuracy : undefined;
 
-    const link = await db.get("SELECT * FROM links WHERE slug = $1", [slug]);
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", slug).maybeSingle();
+    if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: "link not found" });
     if (!link.active) return res.status(410).json({ error: "link is paused" });
 
@@ -436,72 +262,78 @@ async function main() {
     const referrer = req.headers.referer || null;
     const ua = req.headers["user-agent"] || null;
 
-    // Insert click first (need ID for embed mode pings), then update geo async
     const geo = await lookupGeo(ip);
     let clickLat = geo.lat, clickLon = geo.lon, clickAcc = null;
     if (lat != null && lon != null && lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180) {
       clickLat = lat; clickLon = lon; clickAcc = acc != null && acc > 0 ? acc : null;
     }
-    await db.run(
-      "INSERT INTO clicks (link_id, ip, referrer, user_agent, country, region, city, lat, lon, isp, gps_accuracy) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
-      [link.id, ip, referrer, ua, geo.country, geo.region, geo.city, clickLat, clickLon, geo.isp, clickAcc]
-    );
-    const clickRow = await db.get("SELECT id FROM clicks WHERE link_id = $1 ORDER BY id DESC LIMIT 1", [link.id]);
+
+    const { data: clickRow, error: clickErr } = await supabase.from("clicks").insert({
+      link_id: link.id, ip, referrer, user_agent: ua,
+      country: geo.country, region: geo.region, city: geo.city,
+      lat: clickLat, lon: clickLon, isp: geo.isp, gps_accuracy: clickAcc
+    }).select("id").single();
+    if (clickErr) throw clickErr;
+
     res.json({ ok: true, click_id: clickRow?.id || null });
   }));
 
-  // ─── Redirect via interstitial (grabs GPS) ───────────────────
+  // ─── Redirect via interstitial ────────────────────────────────
   app.get("/:slug", asyncHandler(async (req, res) => {
-    const link = await db.get("SELECT * FROM links WHERE slug = $1", [req.params.slug]);
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
+    if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: "link not found" });
     if (!link.active) return res.status(410).json({ error: "link is paused" });
-
-    // Serve interstitial that grabs GPS, POSTs click, then redirects or embeds
     res.send(interstitialHTML(link.slug, link.destination, link.tracking_mode || "redirect", Number(link.gps_interval || 30), Number(link.max_pings || 100)));
   }));
 
-  // ─── API: Location Ping (background GPS from embed mode) ─────
+  // ─── API: Location Ping ──────────────────────────────────────
   app.post("/api/ping", asyncHandler(async (req, res) => {
     if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
     const { click_id, lat, lon, accuracy } = req.body;
     if (!click_id) return res.status(400).json({ error: "click_id required" });
     if (typeof lat !== "number" || typeof lon !== "number") return res.status(400).json({ error: "lat and lon must be numbers" });
     if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return res.status(400).json({ error: "invalid coordinates" });
-    // Verify click exists and get link to check max_pings
-    const click = await db.get("SELECT id, link_id FROM clicks WHERE id = $1", [click_id]);
+
+    const { data: click, error: clickErr } = await supabase.from("clicks").select("id, link_id").eq("id", click_id).maybeSingle();
+    if (clickErr) throw clickErr;
     if (!click) return res.status(404).json({ error: "click not found" });
-    const link = await db.get("SELECT max_pings FROM links WHERE id = $1", [click.link_id]);
+
+    const { data: link, error: linkErr } = await supabase.from("links").select("max_pings").eq("id", click.link_id).maybeSingle();
+    if (linkErr) throw linkErr;
     const maxPings = Number(link?.max_pings || 100);
     if (maxPings > 0) {
-      const pingCount = await db.get("SELECT COUNT(*) as cnt FROM location_pings WHERE click_id = $1", [click_id]);
-      if (Number(pingCount?.cnt || 0) >= maxPings) return res.status(429).json({ error: "ping limit reached" });
+      const { count, error: pingCountErr } = await supabase.from("location_pings").select("*", { count: "exact", head: true }).eq("click_id", click_id);
+      if (pingCountErr) throw pingCountErr;
+      if (Number(count || 0) >= maxPings) return res.status(429).json({ error: "ping limit reached" });
     }
-    await db.run("INSERT INTO location_pings (click_id, lat, lon, accuracy) VALUES ($1, $2, $3, $4)", [click_id, lat, lon, typeof accuracy === "number" && accuracy > 0 ? accuracy : null]);
+
+    const { error: insertErr } = await supabase.from("location_pings").insert({ click_id, lat, lon, accuracy: typeof accuracy === "number" && accuracy > 0 ? accuracy : null });
+    if (insertErr) throw insertErr;
     res.json({ ok: true });
   }));
 
-  // ─── SMS: Send tracked link via text ───────────────────────────
-  // Supports: SignalWire (default), Telnyx, Vonage, or generic webhook
-  const SMS_PROVIDER = process.env.SMS_PROVIDER || "signalwire"; // signalwire | telnyx | vonage | webhook
-  const SMS_FROM = process.env.SMS_FROM || ""; // phone number or sender ID
+  // ─── SMS ────────────────────────────────────────────────────────
+  const SMS_PROVIDER = process.env.SMS_PROVIDER || "signalwire";
+  const SMS_FROM = process.env.SMS_FROM || "";
 
   async function sendSMS(to, body) {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // 15s per SMS
+    const timeout = setTimeout(() => controller.abort(), 15000);
     try {
     if (SMS_PROVIDER === "signalwire") {
-      const SW_SPACE = process.env.SIGNALWIRE_SPACE;  // e.g. "your-space"
+      const SW_SPACE = process.env.SIGNALWIRE_SPACE;
       const SW_PROJECT = process.env.SIGNALWIRE_PROJECT_ID;
       const SW_TOKEN = process.env.SIGNALWIRE_API_TOKEN;
       if (!SW_SPACE || !SW_PROJECT || !SW_TOKEN) throw new Error("SIGNALWIRE_SPACE + SIGNALWIRE_PROJECT_ID + SIGNALWIRE_API_TOKEN not set");
       if (!SMS_FROM) throw new Error("SMS_FROM not set");
-      const res = await fetch(`https://${SW_SPACE}.signalwire.com/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Messages.json`, {
+      const r = await fetch(`https://${SW_SPACE}.signalwire.com/api/laml/2010-04-01/Accounts/${SW_PROJECT}/Messages.json`, {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded", "Authorization": `Basic ${Buffer.from(`${SW_PROJECT}:${SW_TOKEN}`).toString("base64")}` },
         body: new URLSearchParams({ From: SMS_FROM, To: to, Body: body }).toString(),
         signal: controller.signal,
       });
-      const data = await res.json();
+      const data = await r.json();
       if (data.code || data.error_message) throw new Error(data.error_message || data.message || "SignalWire error");
       return { id: data.sid, status: data.status || "sent", provider: "signalwire" };
     }
@@ -509,13 +341,13 @@ async function main() {
       const TELNYX_KEY = process.env.TELNYX_API_KEY;
       if (!TELNYX_KEY) throw new Error("TELNYX_API_KEY not set");
       if (!SMS_FROM) throw new Error("SMS_FROM not set");
-      const res = await fetch("https://api.telnyx.com/v2/messages", {
+      const r = await fetch("https://api.telnyx.com/v2/messages", {
         method: "POST",
         headers: { "Content-Type": "application/json", "Authorization": `Bearer ${TELNYX_KEY}` },
         body: JSON.stringify({ from: SMS_FROM, to, text: body }),
         signal: controller.signal,
       });
-      const data = await res.json();
+      const data = await r.json();
       if (data.errors) throw new Error(data.errors[0]?.message || "Telnyx error");
       return { id: data.data?.id, status: data.data?.message_status_text || "sent", provider: "telnyx" };
     }
@@ -524,52 +356,50 @@ async function main() {
       const VONAGE_SECRET = process.env.VONAGE_API_SECRET;
       if (!VONAGE_KEY || !VONAGE_SECRET) throw new Error("VONAGE_API_KEY + VONAGE_API_SECRET not set");
       if (!SMS_FROM) throw new Error("SMS_FROM not set");
-      const res = await fetch(`https://rest.nexmo.com/sms/json`, {
+      const r = await fetch("https://rest.nexmo.com/sms/json", {
         method: "POST",
         headers: { "Content-Type": "application/x-www-form-urlencoded" },
         body: new URLSearchParams({ api_key: VONAGE_KEY, api_secret: VONAGE_SECRET, from: SMS_FROM, to, text: body }).toString(),
         signal: controller.signal,
       });
-      const data = await res.json();
+      const data = await r.json();
       if (data.messages?.[0]?.status !== "0") throw new Error(data.messages?.[0]?.error_text || "Vonage error");
       return { id: data.messages?.[0]?.message_id, status: "sent", provider: "vonage" };
     }
     if (SMS_PROVIDER === "webhook") {
       const WEBHOOK_URL = process.env.SMS_WEBHOOK_URL;
       if (!WEBHOOK_URL) throw new Error("SMS_WEBHOOK_URL not set");
-      const res = await fetch(WEBHOOK_URL, {
+      const r = await fetch(WEBHOOK_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ from: SMS_FROM, to, text: body }),
         signal: controller.signal,
       });
-      const data = await res.json();
+      const data = await r.json();
       return { status: "sent", provider: "webhook", ...data };
     }
     throw new Error(`Unknown SMS_PROVIDER: ${SMS_PROVIDER}`);
     } finally { clearTimeout(timeout); }
   }
 
-  // ─── API: Send SMS ──────────────────────────────────────────────
   app.post("/api/links/:slug/sms", asyncHandler(async (req, res) => {
     if (!req.body || typeof req.body !== "object") return res.status(400).json({ error: "JSON body required" });
     const { to, message } = req.body;
     if (!to) return res.status(400).json({ error: "'to' is required (phone number or array of numbers)" });
 
-    const link = await db.get("SELECT * FROM links WHERE slug = $1", [req.params.slug]);
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
+    if (linkErr) throw linkErr;
     if (!link) return res.status(404).json({ error: "link not found" });
 
     const shortUrl = `${baseUrl(req)}/${link.slug}`;
     const numbers = Array.isArray(to) ? to : [to];
     if (numbers.length > 50) return res.status(400).json({ error: "max 50 recipients per request" });
-    // Basic E.164 phone number validation: + followed by 7-15 digits
     const isValidPhone = n => /^\+[1-9]\d{6,14}$/.test(String(n).replace(/[\s()-]/g, ""));
     const invalidNums = numbers.filter(n => !isValidPhone(n));
     if (invalidNums.length) return res.status(400).json({ error: `invalid phone number(s): ${invalidNums.join(", ")}. Use E.164 format: +15551234567` });
     const body = message ? message.replace("{link}", shortUrl) : `${link.label ? link.label + ": " : ""}${shortUrl}`;
-    if (body.length > 1600) return res.status(400).json({ error: "message too long (max 1600 chars — 10 SMS segments)" });
+    if (body.length > 1600) return res.status(400).json({ error: "message too long (max 1600 chars)" });
 
-    // Send in parallel (up to 50) with Promise.allSettled for speed
     const results = await Promise.allSettled(numbers.map(async num => {
       try {
         const result = await sendSMS(num, body);
@@ -582,7 +412,6 @@ async function main() {
     res.json({ sent: settled.filter(r => r.status !== "error").length, failed: settled.filter(r => r.status === "error").length, results: settled });
   }));
 
-  // ─── API: SMS status (check if configured) ──────────────────────
   app.get("/api/sms/status", (req, res) => {
     const configured = {
       signalwire: !!(process.env.SIGNALWIRE_SPACE && process.env.SIGNALWIRE_PROJECT_ID && process.env.SIGNALWIRE_API_TOKEN && SMS_FROM),
@@ -594,13 +423,11 @@ async function main() {
   });
 
   // ─── Dashboard ─────────────────────────────────────────────────
-  const DASH_HTML = dashboardHTML(); // Cache — static, no per-request data
+  const DASH_HTML = dashboardHTML();
   app.get("/", (req, res) => { res.setHeader("Cache-Control", "public, max-age=3600"); res.send(DASH_HTML); });
 
-  // 404 for any unmatched routes (after all API + slug routes)
   app.use((req, res) => { res.status(404).json({ error: "not found" }); });
 
-  // Catch-all error handler — returns JSON instead of Express default HTML 500
   app.use((err, req, res, next) => {
     console.error("Unhandled route error:", err.message || err);
     res.status(err.status || 500).json({ error: err.message || "internal server error" });
@@ -611,15 +438,13 @@ async function main() {
     console.log(`\n🔗  LinkLocator running at http://localhost:${PORT}`);
     console.log(`    Dashboard:  http://localhost:${PORT}/`);
     console.log(`    API:        http://localhost:${PORT}/api/links`);
-    console.log(`    DB:         ${db.type}${process.env.DATABASE_URL ? " (Postgres)" : " (SQLite)"}\n`);
+    console.log(`    DB:         Supabase\n`);
   });
-  server.timeout = 30000; // 30s request timeout
+  server.timeout = 30000;
 }
 
 function interstitialHTML(slug, destination, trackingMode, gpsInterval, maxPings) {
-  // Safety: re-validate destination protocol in case DB was modified directly
   if (!/^https?:\/\//i.test(destination)) destination = "about:blank";
-  // HTML-escape destination for attribute contexts (prevents XSS via " in URL)
   const destEsc = destination.replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   const isEmbed = trackingMode === "embed";
   const title = isEmbed ? "Loading…" : "Redirecting…";
@@ -652,7 +477,6 @@ function stopTracking() {
   if (geoWatchId != null) navigator.geolocation.clearWatch(geoWatchId);
 }
 
-// Stop tracking when page is hidden/closed
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopTracking(); else startTracking(); });
 window.addEventListener('beforeunload', stopTracking);` : "";
 
@@ -663,7 +487,7 @@ ${isEmbed ? `#frame{position:fixed;inset:0;width:100%;height:100%;border:none;}`
 ${isEmbed ? `#loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:0.9rem;z-index:10;}` : ``}
 </style></head>
 <body>
-${isEmbed ? `<div id="loading"><p>Loading…</p></div><iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : `<p>Redirecting…</p>`}
+${isEmbed ? `<div id="loading"><p>Loading\u2026</p></div><iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : `<p>Redirecting\u2026</p>`}
 <noscript><meta http-equiv="refresh" content="0;url=${destEsc}"><p style="margin-top:1rem;text-align:center;">JavaScript is disabled. <a href="${destEsc}">Click here to continue</a>.</p></noscript>
 <script>
 const SLUG = ${JSON.stringify(slug).replace(/<\/script/gi, '<\\/script')};
@@ -687,7 +511,6 @@ function redirect() {
 }
 
 ${isEmbed ? `
-// Embed mode: post click, then start GPS watch
 let clickPosted = false;
 function postAndTrack(gpsData) {
   if (clickPosted) return;
@@ -707,7 +530,6 @@ if (navigator.geolocation) {
 } else {
   postAndTrack(null);
 }` : `
-// Redirect mode: post click + redirect
 let clickPosted = false;
 function postAndRedirect(gpsData) {
   if (!clickPosted) {
@@ -739,7 +561,7 @@ function dashboardHTML() {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LinkLocator — Link Tracker</title>
+<title>LinkLocator \u2014 Link Tracker</title>
 <style>
   :root {
     --bg: #0f1117; --surface: #1a1d27; --border: #2a2d3a;
@@ -758,8 +580,8 @@ function dashboardHTML() {
   .form-row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end; }
   .form-group { display: flex; flex-direction: column; flex: 1; min-width: 180px; }
   .form-group label { font-size: 0.75rem; color: var(--muted); margin-bottom: 0.35rem; font-weight: 500; text-transform: uppercase; letter-spacing: 0.05em; }
-  input, button { font-size: 0.875rem; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); padding: 0.6rem 0.75rem; outline: none; transition: border-color 0.2s; }
-  input:focus { border-color: var(--accent); }
+  input, button, select { font-size: 0.875rem; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); padding: 0.6rem 0.75rem; outline: none; transition: border-color 0.2s; }
+  input:focus, select:focus { border-color: var(--accent); }
   input::placeholder { color: var(--muted); }
   button { cursor: pointer; border: none; font-weight: 600; white-space: nowrap; }
   .btn-primary { background: var(--accent); color: #fff; }
@@ -808,8 +630,8 @@ function dashboardHTML() {
 <body>
 <div class="container">
   <header>
-    <h1>🔗 <span>Link</span>Locator</h1>
-    <p>Create tracked short links. Monitor every click — IP, location, referrer, device. <button onclick="whoami()" class="btn-sm btn-muted" style="margin-left:0.5rem;">🌐 My IP</button></p>
+    <h1>\ud83d\udd17 <span>Link</span>Locator</h1>
+    <p>Create tracked short links. Monitor every click \u2014 IP, location, referrer, device. <button onclick="whoami()" class="btn-sm btn-muted" style="margin-left:0.5rem;">\ud83c\udf10 My IP</button></p>
   </header>
   <div class="card">
     <form id="createForm" class="form-row">
@@ -825,7 +647,7 @@ function dashboardHTML() {
         <label>Label (optional)</label>
         <input type="text" id="labelInput" placeholder="Campaign name">
       </div>
-      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
+      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
     </form>
   </div>
   <div class="card" id="linksCard">
@@ -833,14 +655,14 @@ function dashboardHTML() {
       <thead><tr><th>Short Link</th><th>Destination</th><th>Label</th><th>Clicks</th><th>Status</th><th>Created</th><th></th></tr></thead>
       <tbody id="linksBody"></tbody>
     </table>
-    <div id="emptyState" class="empty-state" style="display:none;"><div class="icon">📭</div><div>No links yet. Create one above!</div></div>
+    <div id="emptyState" class="empty-state" style="display:none;"><div class="icon">\ud83d\udced</div><div>No links yet. Create one above!</div></div>
   </div>
 </div>
 <div class="modal-overlay" id="modalOverlay"><div class="modal" id="modalContent"></div></div>
 <div class="modal-overlay" id="smsModal" onclick="if(event.target===this)closeSmsModal()">
   <div class="modal" style="max-width:500px;">
-    <button class="close-btn" onclick="closeSmsModal()">✕</button>
-    <h2>📱 Send via Text</h2>
+    <button class="close-btn" onclick="closeSmsModal()">\u2715</button>
+    <h2>\ud83d\udcf1 Send via Text</h2>
     <p style="color:var(--muted);font-size:0.8rem;margin-bottom:1rem;" id="smsLinkPreview"></p>
     <div style="margin-bottom:0.75rem;">
       <label style="font-size:0.75rem;color:var(--muted);font-weight:500;text-transform:uppercase;letter-spacing:0.05em;">Phone Numbers</label>
@@ -861,9 +683,9 @@ async function api(m,p,b){const o={method:m,headers:{'Content-Type':'application
 function showToast(m){const t=document.getElementById('toast');t.textContent=m;t.classList.add('show');clearTimeout(t._tid);t._tid=setTimeout(()=>t.classList.remove('show'),2500);}
 function copyUrl(u){try{navigator.clipboard.writeText(u);}catch{const t=document.createElement('textarea');t.value=u;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);}showToast('Copied!');}
 function esc(s){if(!s)return'';const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-function fmtDate(d){if(!d)return'—';try{return new Date(d).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'});}catch{return d;}}
-function fmtDT(d){if(!d)return'—';try{return new Date(d).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}catch{return d;}}
-function flagEmoji(c){if(!c||c==='Local'||c.length!==2)return '📍';try{const code=c.toUpperCase();let out='';for(let i=0;i<code.length;i++)out+=String.fromCodePoint(127397+code.charCodeAt(i));return out;}catch{return '🌐';}}
+function fmtDate(d){if(!d)return'\u2014';try{return new Date(d).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'});}catch{return d;}}
+function fmtDT(d){if(!d)return'\u2014';try{return new Date(d).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});}catch{return d;}}
+function flagEmoji(c){if(!c||c==='Local'||c.length!==2)return '\ud83d\udccd';try{const code=c.toUpperCase();let out='';for(let i=0;i<code.length;i++)out+=String.fromCodePoint(127397+code.charCodeAt(i));return out;}catch{return '\ud83c\udf10';}}
 async function loadLinks(){
   const links=await api('GET','/api/links');
   const tbody=document.getElementById('linksBody');
@@ -874,9 +696,9 @@ async function loadLinks(){
   tbody.innerHTML=links.map(l=>\`<tr>
     <td><span class="slug">/\${esc(l.slug)}</span><br><span class="short-url" data-url="\${location.origin}/\${esc(l.slug)}" onclick="copyUrl(this.dataset.url)">\${location.origin}/\${l.slug}</span></td>
     <td><span class="destination" title="\${esc(l.destination)}">\${esc(l.destination)}</span></td>
-    <td>\${esc(l.label)||'<span style="color:var(--muted)">—</span>'}</td>
+    <td>\${esc(l.label)||'<span style="color:var(--muted)">\u2014</span>'}</td>
     <td><span class="click-count">\${l.click_count}</span></td>
-    <td><span class="badge \${l.active?'badge-active':'badge-inactive'}">\${l.active?'Active':'Paused'}</span>'+(l.tracking_mode==='embed'?' <span style="font-size:0.6rem;color:var(--green);">📡 Live</span>':'')</span>'+(l.tracking_mode==='embed'?' <span style="font-size:0.6rem;color:var(--green);">📡 Live</span>':'')</span></td>
+    <td><span class="badge \${l.active?'badge-active':'badge-inactive'}">\${l.active?'Active':'Paused'}</span>\${l.tracking_mode==='embed'?' <span style="font-size:0.6rem;color:var(--green);">\ud83d\udce1 Live</span>':''}</td>
     <td>\${fmtDate(l.created_at)}</td>
     <td class="actions">
       <button class="btn-sm btn-primary" data-slug="\${esc(l.slug)}" onclick="viewDetail(this.dataset.slug)">Details</button>
@@ -889,10 +711,12 @@ document.getElementById('createForm').addEventListener('submit',async e=>{
   e.preventDefault();
   const dest=document.getElementById('destInput').value;
   const slug=document.getElementById('slugInput').value||undefined;
-  const label=document.getElementById('labelInput').value||undefined;const tracking_mode=document.getElementById('trackingInput').value;const gps_interval=parseInt(document.getElementById('intervalInput').value)||30;const tracking_mode=document.getElementById('trackingInput').value;const gps_interval=parseInt(document.getElementById('intervalInput').value)||30;
+  const label=document.getElementById('labelInput').value||undefined;
+  const tracking_mode=document.getElementById('trackingInput').value;
+  const gps_interval=parseInt(document.getElementById('intervalInput').value)||30;
   try{const r=await api('POST','/api/links',{destination:dest,slug,label,tracking_mode,gps_interval});if(r.error){showToast('Error: '+r.error);return;}
   document.getElementById('destInput').value='';document.getElementById('slugInput').value='';document.getElementById('labelInput').value='';
-  showToast('Link created!');if(r.iframe_warning)setTimeout(()=>showToast('⚠️ '+r.iframe_warning),2600);loadLinks();}catch(e){showToast('Error creating link');}
+  showToast('Link created!');if(r.iframe_warning)setTimeout(()=>showToast('\u26a0\ufe0f '+r.iframe_warning),2600);loadLinks();}catch(e){showToast('Error creating link');}
 });
 async function toggleLink(s){const r=await api('PATCH','/api/links/'+s+'/toggle');if(r.error)showToast('Error: '+r.error);else loadLinks();}
 async function deleteLink(s){if(!confirm('Delete this link and all click data?'))return;const r=await api('DELETE','/api/links/'+s);if(r.error)showToast('Error: '+r.error);else loadLinks();}
@@ -902,14 +726,16 @@ async function viewDetail(slug){
   const st=data.stats||{};
   const maxDay=Math.max(...(data.by_day||[]).map(d=>d.count),1);
   const dayBars=(data.by_day||[]).slice(0,14).reverse().map(d=>'<div class="bar-row"><span class="bar-label">'+d.day.slice(5)+'</span><div class="bar-fill" style="width:'+(d.count/maxDay*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('');
-  const cRows=(data.recent_clicks||[]).slice(0,50).map(c=>{const gps=c.gps_accuracy!=null;const hasCoords=c.lat!=null&&c.lon!=null;const locStr=hasCoords?'<a href="#" onclick="showStreetView('+c.lat+','+c.lon+');return false;" style="color:var(--accent);cursor:pointer;text-decoration:none;">'+(gps?'<span style="color:var(--green);">📡 GPS</span> '+(c.lat.toFixed(4)+', '+c.lon.toFixed(4))+' <span style="color:var(--muted);font-size:0.55rem;">\u00B1'+Math.round(c.gps_accuracy)+'m</span>':flagEmoji(c.country)+' '+(esc(c.city)||'—')+', '+(esc(c.region)||'—')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>')+' 🏠</a>':(gps?'<span style="color:var(--green);">📡 GPS</span> —':flagEmoji(c.country)+' '+(esc(c.city)||'—')+', '+(esc(c.region)||'—')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>');return '<tr><td>'+fmtDT(c.clicked_at)+'</td><td>'+esc(c.ip)+'</td><td>'+locStr+'</td><td title="'+esc(c.user_agent)+'">'+esc((c.user_agent||'').slice(0,35))+'</td><td title="'+esc(c.referrer)+'">'+(esc((c.referrer||'').slice(0,25))||'Direct')+'</td></tr>';}).join('');
+  const cRows=(data.recent_clicks||[]).slice(0,50).map(c=>{const gps=c.gps_accuracy!=null;const hasCoords=c.lat!=null&&c.lon!=null;const locStr=hasCoords?'<a href="#" onclick="showStreetView('+c.lat+','+c.lon+');return false;" style="color:var(--accent);cursor:pointer;text-decoration:none;">'+(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> '+(c.lat.toFixed(4)+', '+c.lon.toFixed(4))+' <span style="color:var(--muted);font-size:0.55rem;">\u00b1'+Math.round(c.gps_accuracy)+'m</span>':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>')+' \ud83c\udfe0</a>':(gps?'<span style="color:var(--green);">\ud83d\udce1 GPS</span> \u2014':flagEmoji(c.country)+' '+(esc(c.city)||'\u2014')+', '+(esc(c.region)||'\u2014')+' <span style="color:var(--muted);font-size:0.6rem;">('+(esc(c.country)||'?')+')</span>');return '<tr><td>'+fmtDT(c.clicked_at)+'</td><td>'+esc(c.ip)+'</td><td>'+locStr+'</td><td title="'+esc(c.user_agent)+'">'+esc((c.user_agent||'').slice(0,35))+'</td><td title="'+esc(c.referrer)+'">'+(esc((c.referrer||'').slice(0,25))||'Direct')+'</td></tr>';}).join('');
   let countryBars='',cityBars='';
   if(data.by_country&&data.by_country.length){const mx=Math.max(...data.by_country.map(x=>x.count),1);countryBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By Country</h3><div class="bar-chart">'+data.by_country.map(d=>'<div class="bar-row"><span class="bar-label">'+flagEmoji(d.country)+' '+esc(d.country)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
   if(data.by_city&&data.by_city.length){const mx=Math.max(...data.by_city.map(x=>x.count),1);cityBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By City</h3><div class="bar-chart">'+data.by_city.map(d=>'<div class="bar-row"><span class="bar-label">'+esc(d.city)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
+  let pingSection='';
+  if(data.location_pings&&data.location_pings.length){pingSection='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">\ud83d\udce1 Location Pings ('+data.location_pings.length+')</h3><div style="max-height:150px;overflow-y:auto;font-size:0.7rem;">'+data.location_pings.map(function(p){return '<span style="color:var(--muted);">'+fmtDT(p.pinged_at)+'</span> '+(p.lat!=null?p.lat.toFixed(4):'?')+', '+(p.lon!=null?p.lon.toFixed(4):'?')+(p.accuracy?' \u00b1'+Math.round(p.accuracy)+'m':'')+'<br>';}).join('')+'</div>';}
   document.getElementById('modalContent').innerHTML=
-    '<button class="close-btn" onclick="closeModal()">✕</button>'+
-    '<h2>📊 <span class="slug">/'+esc(data.slug)+'</span></h2>'+
-    '<p style="color:var(--muted);font-size:0.8rem;margin-bottom:1rem;">→ '+esc(data.destination)+'</p>'+
+    '<button class="close-btn" onclick="closeModal()">\u2715</button>'+
+    '<h2>\ud83d\udcca <span class="slug">/'+esc(data.slug)+'</span></h2>'+
+    '<p style="color:var(--muted);font-size:0.8rem;margin-bottom:1rem;">\u2192 '+esc(data.destination)+'</p>'+
     '<div class="stat-grid">'+
       '<div class="stat-box"><div class="val">'+(st.total||0)+'</div><div class="lbl">Total Clicks</div></div>'+
       '<div class="stat-box"><div class="val">'+(st.unique_ips||0)+'</div><div class="lbl">Unique IPs</div></div>'+
@@ -917,10 +743,10 @@ async function viewDetail(slug){
       '<div class="stat-box"><div class="val">'+fmtDate(st.last_click)+'</div><div class="lbl">Last Click</div></div>'+
     '</div>'+
     (dayBars?'<h3 style="font-size:0.8rem;margin-bottom:0.5rem;">Clicks by Day</h3><div class="bar-chart">'+dayBars+'</div>':'')+
-    countryBars+cityBars+
+    countryBars+cityBars+pingSection+
     '<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">Recent Clicks</h3>'+
     '<div style="overflow-x:auto;"><table class="clicks-table"><thead><tr><th>Time</th><th>IP</th><th>Location</th><th>Device</th><th>Referrer</th></tr></thead><tbody>'+(cRows||'<tr><td colspan="5" style="text-align:center;padding:1rem;">No clicks yet</td></tr>')+'</tbody></table></div>'+
-    '<div id="streetViewPanel" style="display:none;margin-top:1rem;"><h3 style="font-size:0.8rem;margin:0 0 0.5rem;">🏠 Street View</h3><iframe id="streetViewFrame" style="width:100%;height:300px;border:1px solid var(--border);border-radius:10px;" sandbox="allow-scripts allow-popups" allowfullscreen loading="lazy"></iframe><div style="font-size:0.65rem;color:var(--muted);margin-top:0.3rem;">Click any 🏠 location above to view</div></div>';
+    '<div id="streetViewPanel" style="display:none;margin-top:1rem;"><h3 style="font-size:0.8rem;margin:0 0 0.5rem;">\ud83c\udfe0 Street View</h3><iframe id="streetViewFrame" style="width:100%;height:300px;border:1px solid var(--border);border-radius:10px;" sandbox="allow-scripts allow-popups" allowfullscreen loading="lazy"></iframe><div style="font-size:0.65rem;color:var(--muted);margin-top:0.3rem;">Click any \ud83c\udfe0 location above to view</div></div>';
   document.getElementById('modalOverlay').classList.add('open');
 }
 function closeModal(){document.getElementById('modalOverlay').classList.remove('open');}
@@ -933,24 +759,16 @@ function showStreetView(lat,lon){
 }
 document.getElementById('modalOverlay').addEventListener('click',e=>{if(e.target===e.currentTarget)closeModal();});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'){closeSmsModal();closeModal();}});
-loadLinks();
-async function whoami(){const d=await api("GET","/api/whoami");const g=d.geo||{};const mc=document.getElementById("modalContent");const ip=d.ip_seen||"?";mc.innerHTML="<button class="close-btn" onclick="closeModal()">✕</button><h2>🌐 My IP Info</h2><div class="stat-grid"><div class="stat-box"><div class="val" style="font-size:0.85rem;font-family:monospace;word-break:break-all;">"+esc(ip)+"</div><div class="lbl">IP Address</div></div><div class="stat-box"><div class="val">"+flagEmoji(g.country)+" "+(esc(g.city)||"—")+"</div><div class="lbl">City</div></div><div class="stat-box"><div class="val">"+(esc(g.region)||"—")+"</div><div class="lbl">Region</div></div><div class="stat-box"><div class="val">"+(esc(g.country)||"—")+"</div><div class="lbl">Country</div></div><div class="stat-box"><div class="val">"+(esc(g.isp)||"—")+"</div><div class="lbl">ISP</div></div><div class="stat-box"><div class="val">"+(g.lat!=null?g.lat.toFixed(6):"—")+", "+(g.lon!=null?g.lon.toFixed(6):"—")+"</div><div class="lbl">Lat, Lon</div></div></div>"+(d.hint?"<p style="color:var(--muted);font-size:0.75rem;margin-top:0.5rem;">⚠️ "+esc(d.hint)+"</p>":"")+(d.forwarded_for?"<p style="color:var(--muted);font-size:0.7rem;margin-top:0.5rem;">X-Forwarded-For: "+esc(d.forwarded_for)+"</p>":"");document.getElementById("modalOverlay").classList.add("open");}
+async function whoami(){const d=await api('GET','/api/whoami');const g=d.geo||{};const mc=document.getElementById('modalContent');const ip=d.ip_seen||'?';mc.innerHTML='<button class="close-btn" onclick="closeModal()">\u2715</button><h2>\ud83c\udf10 My IP Info</h2><div class="stat-grid"><div class="stat-box"><div class="val" style="font-size:0.85rem;font-family:monospace;word-break:break-all;">'+esc(ip)+'</div><div class="lbl">IP Address</div></div><div class="stat-box"><div class="val">'+flagEmoji(g.country)+' '+(esc(g.city)||'\u2014')+'</div><div class="lbl">City</div></div><div class="stat-box"><div class="val">'+(esc(g.region)||'\u2014')+'</div><div class="lbl">Region</div></div><div class="stat-box"><div class="val">'+(esc(g.country)||'\u2014')+'</div><div class="lbl">Country</div></div><div class="stat-box"><div class="val">'+(esc(g.isp)||'\u2014')+'</div><div class="lbl">ISP</div></div><div class="stat-box"><div class="val">'+(g.lat!=null?g.lat.toFixed(6):'\u2014')+', '+(g.lon!=null?g.lon.toFixed(6):'\u2014')+'</div><div class="lbl">Lat, Lon</div></div></div>'+(d.hint?'<p style="color:var(--muted);font-size:0.75rem;margin-top:0.5rem;">\u26a0\ufe0f '+esc(d.hint)+'</p>':'')+(d.forwarded_for?'<p style="color:var(--muted);font-size:0.7rem;margin-top:0.5rem;">X-Forwarded-For: '+esc(d.forwarded_for)+'</p>':'');document.getElementById('modalOverlay').classList.add('open');}
 function sendSMS(slug,url){document.getElementById('smsLinkPreview').textContent='Short URL: '+url;document.getElementById('smsLinkPreview').dataset.slug=slug;document.getElementById('smsNumbers').value='';document.getElementById('smsMessage').value='';document.getElementById('smsResult').innerHTML='';document.getElementById('smsModal').classList.add('open');}
 function closeSmsModal(){document.getElementById('smsModal').classList.remove('open');}
-async function doSendSMS(){const nums=document.getElementById('smsNumbers').value.trim();if(!nums){showToast('Enter at least one phone number');return;}const to=nums.includes('\n')?nums.split('\n').map(s=>s.trim()).filter(Boolean):nums.split(',').map(s=>s.trim()).filter(Boolean);const msg=document.getElementById('smsMessage').value.trim()||undefined;const slug=document.getElementById('smsLinkPreview').dataset.slug;const rd=document.getElementById('smsResult');rd.innerHTML='Sending\u2026';const r=await api('POST','/api/links/'+slug+'/sms',{to,message:msg});if(r.error){rd.innerHTML='<span style="color:var(--red)">Error: '+esc(r.error)+'</span>';return;}rd.innerHTML='<span style="color:var(--green)">\u2705 '+r.sent+' sent'+(r.failed?', '+r.failed+' failed':'')+'</span>';}
+async function doSendSMS(){const nums=document.getElementById('smsNumbers').value.trim();if(!nums){showToast('Enter at least one phone number');return;}const to=nums.includes('\\n')?nums.split('\\n').map(s=>s.trim()).filter(Boolean):nums.split(',').map(s=>s.trim()).filter(Boolean);const msg=document.getElementById('smsMessage').value.trim()||undefined;const slug=document.getElementById('smsLinkPreview').dataset.slug;const rd=document.getElementById('smsResult');rd.innerHTML='Sending\u2026';const r=await api('POST','/api/links/'+slug+'/sms',{to,message:msg});if(r.error){rd.innerHTML='<span style="color:var(--red)">Error: '+esc(r.error)+'</span>';return;}rd.innerHTML='<span style="color:var(--green)">\u2705 '+r.sent+' sent'+(r.failed?', '+r.failed+' failed':'')+'</span>';}
+loadLinks();
 </script>
-
 </body></html>`;
 }
 
 main().catch(console.error);
 
-// Guard against unhandled rejections crashing the process silently
-process.on("unhandledRejection", (reason, promise) => {
-  console.error("Unhandled Rejection:", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("Uncaught Exception:", err);
-  // Give logs time to flush, then exit — process manager will restart
-  setTimeout(() => process.exit(1), 100);
-});
+process.on("unhandledRejection", (reason) => { console.error("Unhandled Rejection:", reason); });
+process.on("uncaughtException", (err) => { console.error("Uncaught Exception:", err); setTimeout(() => process.exit(1), 100); });
