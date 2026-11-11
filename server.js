@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const { nanoid } = require("nanoid");
 const { createClient } = require("@supabase/supabase-js");
